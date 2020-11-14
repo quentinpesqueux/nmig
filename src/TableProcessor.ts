@@ -25,6 +25,7 @@ import DBAccessQueryResult from './DBAccessQueryResult';
 import IDBAccessQueryParams from './IDBAccessQueryParams';
 import DBVendors from './DBVendors';
 import * as extraConfigProcessor from './ExtraConfigProcessor';
+import { getRawDataColumnName } from './RawDataPostgreSQLArranger';
 
 /**
  * Converts MySQL data types to corresponding PostgreSQL data types.
@@ -99,6 +100,7 @@ export const createTable = async (conversion: Conversion, tableName: string): Pr
         return;
     }
 
+    const rawDataColumnDefinition: string = `${ getRawDataColumnName(conversion._schema, tableName) } JSONB`;
     const columnsDefinition: string = columns.data
         .map((column: any) => {
             const colName: string = extraConfigProcessor.getColumnName(conversion, originalTableName, column.Field, false);
@@ -107,12 +109,16 @@ export const createTable = async (conversion: Conversion, tableName: string): Pr
         })
         .join(',');
 
-    params.sql = `CREATE TABLE IF NOT EXISTS "${ conversion._schema }"."${ tableName }"(${ columnsDefinition });`;
+    params.sql = `CREATE TABLE IF NOT EXISTS "${ conversion._schema }"."${ tableName }"(${ columnsDefinition }, ${ rawDataColumnDefinition });`;
     params.processExitOnError = true;
     params.vendor = DBVendors.PG;
     const createTableResult: DBAccessQueryResult = await DBAccess.query(params);
 
     if (!createTableResult.error) {
-        log(conversion, `\t--[${ logTitle }] Table "${ conversion._schema }"."${ tableName }" is created...`, conversion._dicTables[tableName].tableLogPath);
+        log(
+            conversion,
+            `\t--[${ logTitle }] Table "${ conversion._schema }"."${ tableName }" is created...`,
+            conversion._dicTables[tableName].tableLogPath
+        );
     }
 };

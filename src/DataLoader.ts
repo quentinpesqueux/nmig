@@ -29,7 +29,9 @@ import { dataTransferred } from './ConsistencyEnforcer';
 import IDBAccessQueryParams from './IDBAccessQueryParams';
 import * as extraConfigProcessor from './ExtraConfigProcessor';
 import { getDataPoolTableName } from './DataPoolManager';
+import { getRawDataColumnName } from './RawDataPostgreSQLArranger';
 import * as path from 'path';
+import { pipeline, Readable, Transform, TransformCallback } from 'stream';
 import { PoolClient, QueryResult } from 'pg';
 import { PoolConnection } from 'mysql';
 const { from } = require('pg-copy-streams'); // No declaration file for module "pg-copy-streams".
@@ -69,6 +71,7 @@ const deleteChunk = async (
     client: PoolClient,
     originalSessionReplicationRole: string | null = null
 ): Promise<void> => {
+    const logTitle: string = 'DataLoader::deleteChunk';
     const sql: string = `DELETE FROM ${ getDataPoolTableName(conversion) } WHERE id = ${ dataPoolId };`;
 
     try {
@@ -78,7 +81,7 @@ const deleteChunk = async (
             await enableTriggers(conversion, client, <string>originalSessionReplicationRole);
         }
     } catch (error) {
-        await generateError(conversion, `\t--[DataLoader::deleteChunk] ${ error }`, sql);
+        await generateError(conversion, `\t--[${ logTitle }] ${ error }`, sql);
     } finally {
         await DBAccess.releaseDbClient(conversion, client);
     }
@@ -97,8 +100,9 @@ const processDataError = async (
     client: PoolClient,
     originalSessionReplicationRole: string | null
 ): Promise<void> => {
-    await generateError(conv, `\t--[populateTableWorker] ${ streamError }`, sqlCopy);
-    const rejectedData: string = `\t--[populateTableWorker] Error loading table data:\n${ sql }\n`;
+    const logTitle: string = 'DataLoader::processDataError';
+    await generateError(conv, `\t--[${ logTitle }] ${ streamError }`, sqlCopy);
+    const rejectedData: string = `\t--[${ logTitle }] Error loading table data:\n${ sql }\n`;
     log(conv, rejectedData, path.join(conv._logsDirPath, `${ tableName }.log`));
     await deleteChunk(conv, dataPoolId, client, originalSessionReplicationRole);
     processSend(new MessageToMaster(tableName, 0));
@@ -125,6 +129,25 @@ const populateTableWorker = async (
         originalSessionReplicationRole = await disableTriggers(conv, client);
     }
 
+    const mysqlClientErrorHandler = async (err: string) => {
+        await processDataError(conv, err, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
+    };
+
+    const readDataStream: Readable = mysqlClient
+        .query(sql)
+        .on('error', mysqlClientErrorHandler)
+        .stream({ highWaterMark: conv._streamsHighWaterMark });
+
+    const sourceDataTransformStream: Transform = new Transform({
+        objectMode: true,
+        transform: (record: any, encoding: BufferEncoding, callback: TransformCallback) => {
+            callback(null, JSON.stringify({
+                ...record,
+                [getRawDataColumnName(conv._schema, tableName)]: record
+            }));
+        }
+    });
+
     const copyStream: any = getCopyStream(
         conv,
         client,
@@ -136,17 +159,20 @@ const populateTableWorker = async (
         originalSessionReplicationRole
     );
 
-    const json2csvStream = await getJson2csvStream(conv, originalTableName, dataPoolId, client, originalSessionReplicationRole);
-    const mysqlClientErrorHandler = async (err: string) => {
-        await processDataError(conv, err, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
-    };
-
-    mysqlClient
-        .query(sql)
-        .on('error', mysqlClientErrorHandler)
-        .stream({ highWaterMark: conv._streamsHighWaterMark })
-        .pipe(json2csvStream)
-        .pipe(copyStream);
+    pipeline(readDataStream, sourceDataTransformStream, copyStream, async (pipelineError: Error | null) => {
+        if (pipelineError) {
+            await processDataError(
+                conv,
+                pipelineError.message,
+                sql,
+                sqlCopy,
+                tableName,
+                dataPoolId,
+                client,
+                originalSessionReplicationRole
+            );
+        }
+    });
 };
 
 /**
