@@ -18,22 +18,29 @@
  *
  * @author Anatoly Khaytovich <anatolyuss@gmail.com>
  */
-import { log, generateError } from './FsOps';
-import Conversion from './Conversion';
-import DBAccess from './DBAccess';
-import DBAccessQueryResult from './DBAccessQueryResult';
-import DBVendors from './DBVendors';
-import MessageToMaster from './MessageToMaster';
-import MessageToDataLoader from './MessageToDataLoader';
-import { dataTransferred } from './ConsistencyEnforcer';
-import IDBAccessQueryParams from './IDBAccessQueryParams';
-import * as extraConfigProcessor from './ExtraConfigProcessor';
-import { getDataPoolTableName } from './DataPoolManager';
 import * as path from 'path';
+import { Transform, TransformCallback, Readable, pipeline } from 'stream';
+
 import { PoolClient, QueryResult } from 'pg';
 import { PoolConnection } from 'mysql';
 const { from } = require('pg-copy-streams'); // No declaration file for module "pg-copy-streams".
-const { Transform: Json2CsvTransform } = require('json2csv'); // No declaration file for module "json2csv".
+
+// TODO: consider to remove.
+// const { Transform: Json2CsvTransform } = require('json2csv'); // No declaration file for module "json2csv".
+
+import { log, generateError } from './FsOps';
+import Conversion from './Conversion';
+import DBAccess from './DBAccess';
+import MessageToMaster from './MessageToMaster';
+import MessageToDataLoader from './MessageToDataLoader';
+import { dataTransferred } from './ConsistencyEnforcer';
+import * as extraConfigProcessor from './ExtraConfigProcessor';
+import { getDataPoolTableName } from './DataPoolManager';
+
+// TODO: consider to remove.
+// import IDBAccessQueryParams from './IDBAccessQueryParams';
+// import DBAccessQueryResult from './DBAccessQueryResult';
+// import DBVendors from './DBVendors';
 
 process.on('message', async (signal: MessageToDataLoader) => {
     const { config, chunk } = signal;
@@ -136,18 +143,103 @@ const populateTableWorker = async (
         originalSessionReplicationRole
     );
 
-    const json2csvStream = await getJson2csvStream(conv, originalTableName, dataPoolId, client, originalSessionReplicationRole);
     const mysqlClientErrorHandler = async (err: string) => {
         await processDataError(conv, err, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
     };
 
-    mysqlClient
+    const readDataStream: Readable = mysqlClient
         .query(sql)
         .on('error', mysqlClientErrorHandler)
-        .stream({ highWaterMark: conv._streamsHighWaterMark })
-        .pipe(json2csvStream)
-        .pipe(copyStream);
+        .stream({ highWaterMark: conv._streamsHighWaterMark });
+
+    const transformStream: Transform = new Transform({
+        objectMode: true,
+        transform: (record: any, encoding: BufferEncoding, callback: TransformCallback) => {
+            // console.log(record);process.exit(0);
+            // console.log(record.nmigCsvData);process.exit(0);
+
+            // 1,10001,60117.00,"1986-06-26","1987-06-26","2016-05-04 10:32:25",-1,"Initial test data load","2016-05-04 06:37:54",-1,,0\n
+            // "1","10001","60117.00","1986-06-26","1987-06-26","2016-05-04 10:32:25","-1","Initial test data load","2016-05-04 06:37:54","-1",,"0"\n
+            const x = `${ record.nmigCsvData }\\n`;
+            // console.log(x);process.exit(0);
+            
+            callback(null, x);
+        }
+    });
+
+    // TODO: consider to remove.
+    // const json2csvStream = await getJson2csvStream(conv, originalTableName, dataPoolId, client, originalSessionReplicationRole);
+
+    readDataStream.pipe(transformStream).pipe(copyStream);
+
+    // readDataStream
+    //     .pipe(json2csvStream)
+    //     // .pipe(transformStream)
+    //     .pipe(copyStream);
+
+    // pipeline(
+    //     readDataStream,
+    //     transformStream,
+    //     copyStream,
+    //     async (pipelineError: Error | null) => {
+    //         if (pipelineError) {
+    //             await processDataError(
+    //                 conv,
+    //                 pipelineError.message,
+    //                 sql,
+    //                 sqlCopy,
+    //                 tableName,
+    //                 dataPoolId,
+    //                 client,
+    //                 originalSessionReplicationRole
+    //             );
+    //         }
+    //     }
+    // );
 };
+
+/**
+ * Returns new json-to-csv stream-transform object.
+ */
+// TODO: consider to remove.
+// const getJson2csvStream = async (
+//     conversion: Conversion,
+//     originalTableName: string,
+//     dataPoolId: number,
+//     client: PoolClient,
+//     originalSessionReplicationRole: string | null
+// ): Promise<any> => {
+//     const params: IDBAccessQueryParams = {
+//         conversion: conversion,
+//         caller: 'DataLoader::populateTableWorker',
+//         sql: `SHOW COLUMNS FROM \`${ originalTableName }\`;`,
+//         vendor: DBVendors.MYSQL,
+//         processExitOnError: true,
+//         shouldReturnClient: false
+//     };
+//
+//     const tableColumnsResult: DBAccessQueryResult = await DBAccess.query(params);
+//
+//     const options: any = {
+//         delimiter: conversion._delimiter,
+//         header: false,
+//         fields: tableColumnsResult.data.map((column: any) => column.Field)
+//     };
+//
+//     const streamTransformOptions: any = {
+//         highWaterMark: conversion._streamsHighWaterMark,
+//         objectMode: true,
+//         encoding: conversion._encoding
+//     };
+//
+//     const json2CsvTransformStream = new Json2CsvTransform(options, streamTransformOptions);
+//
+//     json2CsvTransformStream.on('error', async (transformError: string) => {
+//         await processDataError(conversion, transformError, '', '', originalTableName, dataPoolId, client, originalSessionReplicationRole);
+//     });
+//
+//     return json2CsvTransformStream;
+// };
 
 /**
  * Returns new PostgreSQL copy stream object.
@@ -177,48 +269,6 @@ const getCopyStream = (
         });
 
     return copyStream;
-};
-
-/**
- * Returns new json-to-csv stream-transform object.
- */
-const getJson2csvStream = async (
-    conversion: Conversion,
-    originalTableName: string,
-    dataPoolId: number,
-    client: PoolClient,
-    originalSessionReplicationRole: string | null
-): Promise<any> => {
-    const params: IDBAccessQueryParams = {
-        conversion: conversion,
-        caller: 'DataLoader::populateTableWorker',
-        sql: `SHOW COLUMNS FROM \`${ originalTableName }\`;`,
-        vendor: DBVendors.MYSQL,
-        processExitOnError: true,
-        shouldReturnClient: false
-    };
-
-    const tableColumnsResult: DBAccessQueryResult = await DBAccess.query(params);
-
-    const options: any = {
-        delimiter: conversion._delimiter,
-        header: false,
-        fields: tableColumnsResult.data.map((column: any) => column.Field)
-    };
-
-    const streamTransformOptions: any = {
-        highWaterMark: conversion._streamsHighWaterMark,
-        objectMode: true,
-        encoding: conversion._encoding
-    };
-
-    const json2CsvTransformStream = new Json2CsvTransform(options, streamTransformOptions);
-
-    json2CsvTransformStream.on('error', async (transformError: string) => {
-        await processDataError(conversion, transformError, '', '', originalTableName, dataPoolId, client, originalSessionReplicationRole);
-    });
-
-    return json2CsvTransformStream;
 };
 
 /**
