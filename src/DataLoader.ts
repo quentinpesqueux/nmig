@@ -30,6 +30,8 @@ import IDBAccessQueryParams from './IDBAccessQueryParams';
 import * as extraConfigProcessor from './ExtraConfigProcessor';
 import { getDataPoolTableName } from './DataPoolManager';
 import * as path from 'path';
+import { Transform, TransformCallback, Readable, Writable, ReadableOptions } from 'stream';
+import { EventEmitter } from 'events';
 import { PoolClient, QueryResult } from 'pg';
 import { PoolConnection } from 'mysql';
 const { from } = require('pg-copy-streams'); // No declaration file for module "pg-copy-streams".
@@ -108,45 +110,108 @@ const processDataError = async (
  * Loads a chunk of data using "PostgreSQL COPY".
  */
 const populateTableWorker = async (
-    conv: Conversion,
+    conversion: Conversion,
     tableName: string,
     strSelectFieldList: string,
     rowsCnt: number,
     dataPoolId: number
 ): Promise<void> => {
-    const originalTableName: string = extraConfigProcessor.getTableName(conv, tableName, true);
+    const originalTableName: string = extraConfigProcessor.getTableName(conversion, tableName, true);
     const sql: string = `SELECT ${ strSelectFieldList } FROM \`${ originalTableName }\`;`;
-    const mysqlClient: PoolConnection = await DBAccess.getMysqlClient(conv);
-    const sqlCopy: string = `COPY "${ conv._schema }"."${ tableName }" FROM STDIN DELIMITER '${ conv._delimiter }' CSV;`;
-    const client: PoolClient = await DBAccess.getPgClient(conv);
+    const mysqlClient: PoolConnection = await DBAccess.getMysqlClient(conversion);
+    const sqlCopy: string = `COPY "${ conversion._schema }"."${ tableName }" FROM STDIN DELIMITER '${ conversion._delimiter }' CSV;`;
+    const client: PoolClient = await DBAccess.getPgClient(conversion);
     let originalSessionReplicationRole: string | null = null;
 
-    if (conv.shouldMigrateOnlyData()) {
-        originalSessionReplicationRole = await disableTriggers(conv, client);
+    if (conversion.shouldMigrateOnlyData()) {
+        originalSessionReplicationRole = await disableTriggers(conversion, client);
     }
 
-    const copyStream: any = getCopyStream(
-        conv,
-        client,
-        sqlCopy,
-        sql,
-        tableName,
-        rowsCnt,
-        dataPoolId,
-        originalSessionReplicationRole
-    );
+    let dataBuffer: string[] = [];
+    const eventEmitter: EventEmitter = new EventEmitter();
 
-    const json2csvStream = await getJson2csvStream(conv, originalTableName, dataPoolId, client, originalSessionReplicationRole);
+    const json2csvStream = await getJson2csvStream(conversion, originalTableName, dataPoolId, client, originalSessionReplicationRole);
+
     const mysqlClientErrorHandler = async (err: string) => {
-        await processDataError(conv, err, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
+        await processDataError(conversion, err, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
     };
 
-    mysqlClient
+    const readDataStream: Readable = mysqlClient
         .query(sql)
         .on('error', mysqlClientErrorHandler)
-        .stream({ highWaterMark: conv._streamsHighWaterMark })
-        .pipe(json2csvStream)
-        .pipe(copyStream);
+        .stream({ highWaterMark: conversion._streamsHighWaterMark });
+
+    eventEmitter.on('chunkLoaded', () => {
+        // readDataStream.resume();
+        json2csvStream.resume();
+    });
+
+    eventEmitter.on('chunkBuffered', () => {
+        const readableOptions: ReadableOptions = {
+            objectMode: true,
+            highWaterMark: conversion._streamsHighWaterMark,
+        };
+
+        const copyStream: any = getCopyStream(
+            conversion,
+            client,
+            sqlCopy,
+            sql,
+            tableName,
+            rowsCnt,
+            dataPoolId,
+            originalSessionReplicationRole,
+            dataBuffer,
+            eventEmitter
+        );
+
+        const dataStream: Readable = Readable.from(dataBuffer, readableOptions);
+
+        dataStream
+            .on('error', (error: Error) => {
+                console.log();
+                console.error(error);
+            })
+            .on('end', () => dataStream.destroy())
+            .pipe(copyStream);
+    });
+
+    const bufferStream: Writable = new Writable({
+        highWaterMark: conversion._streamsHighWaterMark,
+        objectMode: true,
+        write: (record: any, encoding: BufferEncoding, next: (error?: Error | null) => void) => {
+            // TODO:
+            // !!! Notice, the record with id 16385 is always the last record read.
+            // !!! Seems that Node.js mysql stream always reads from the beginning after resuming.
+            // !!! Resuming the stream from the beginning causes inserting duplicates (always inserts records only from the first batch) !!!
+
+            if (+record.split(',')[0] >= 16384) {
+                console.log(); // TODO: remove asap.
+                console.log(`First record in chunk: ${ record }`);
+                console.log();
+            }
+
+            if (dataBuffer.length === conversion._streamsHighWaterMark) {
+                console.log(); // TODO: remove asap.
+                console.log(`Last record in chunk: ${ record }`);
+                console.log();
+
+                eventEmitter.emit('chunkBuffered');
+                console.log('CONGRATS!!!'); // TODO: remove asap.
+                console.log(dataBuffer.length);
+                console.log(dataBuffer[dataBuffer.length - 1]);
+                console.log();
+                // readDataStream.pause();
+                json2csvStream.pause();
+            } else {
+                dataBuffer.push(record);
+            }
+
+            next();
+        }
+    });
+
+    readDataStream.pipe(json2csvStream).pipe(bufferStream);
 };
 
 /**
@@ -160,7 +225,9 @@ const getCopyStream = (
     tableName: string,
     rowsCnt: number,
     dataPoolId: number,
-    originalSessionReplicationRole: string | null
+    originalSessionReplicationRole: string | null,
+    dataBuffer: string[],
+    eventEmitter: EventEmitter
 ): any => {
     const copyStream: any = client.query(from(sqlCopy));
 
@@ -169,8 +236,13 @@ const getCopyStream = (
             // COPY FROM STDIN does not return the number of rows inserted.
             // But the transactional behavior still applies, meaning no records inserted if at least one failed.
             // That is why in case of 'on finish' the rowsCnt value is actually the number of records inserted.
-            processSend(new MessageToMaster(tableName, rowsCnt));
-            await deleteChunk(conv, dataPoolId, client);
+
+            // TODO: continue.
+            dataBuffer = [];
+            eventEmitter.emit('chunkLoaded');
+
+            // processSend(new MessageToMaster(tableName, rowsCnt));
+            // await deleteChunk(conv, dataPoolId, client);
         })
         .on('error', async (copyStreamError: string) => {
             await processDataError(conv, copyStreamError, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
