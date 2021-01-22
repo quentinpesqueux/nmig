@@ -18,24 +18,24 @@
  *
  * @author Anatoly Khaytovich <anatolyuss@gmail.com>
  */
+import * as path from 'path';
+import { Readable, ReadableOptions } from 'stream';
+import { EventEmitter } from 'events';
+
+import { PoolClient, QueryResult } from 'pg';
+import { PoolConnection, Query } from 'mysql';
+const { from } = require('pg-copy-streams'); // No declaration file for module "pg-copy-streams".
+const { parse } = require('json2csv'); // No declaration file for module "json2csv".
+
 import { log, generateError } from './FsOps';
 import Conversion from './Conversion';
 import DBAccess from './DBAccess';
-import DBAccessQueryResult from './DBAccessQueryResult';
-import DBVendors from './DBVendors';
 import MessageToMaster from './MessageToMaster';
 import MessageToDataLoader from './MessageToDataLoader';
+import CsvParsingOptions from './CsvParsingOptions';
 import { dataTransferred } from './ConsistencyEnforcer';
-import IDBAccessQueryParams from './IDBAccessQueryParams';
 import * as extraConfigProcessor from './ExtraConfigProcessor';
 import { getDataPoolTableName } from './DataPoolManager';
-import * as path from 'path';
-import { Transform, TransformCallback, Readable, Writable, ReadableOptions } from 'stream';
-import { EventEmitter } from 'events';
-import { PoolClient, QueryResult } from 'pg';
-import { PoolConnection } from 'mysql';
-const { from } = require('pg-copy-streams'); // No declaration file for module "pg-copy-streams".
-const { Transform: Json2CsvTransform } = require('json2csv'); // No declaration file for module "json2csv".
 
 process.on('message', async (signal: MessageToDataLoader) => {
     const { config, chunk } = signal;
@@ -117,9 +117,10 @@ const populateTableWorker = async (
     dataPoolId: number
 ): Promise<void> => {
     const originalTableName: string = extraConfigProcessor.getTableName(conversion, tableName, true);
-    const sql: string = `SELECT ${ strSelectFieldList } FROM \`${ originalTableName }\`;`;
+    const sqlRetrieve: string = `SELECT ${ strSelectFieldList } FROM \`${ originalTableName }\`;`;
     const mysqlClient: PoolConnection = await DBAccess.getMysqlClient(conversion);
-    const sqlCopy: string = `COPY "${ conversion._schema }"."${ tableName }" FROM STDIN DELIMITER '${ conversion._delimiter }' CSV;`;
+    const pgTableName: string = `"${ conversion._schema }"."${ tableName }"`;
+    const sqlCopy: string = `COPY ${ pgTableName } FROM STDIN DELIMITER '${ conversion._delimiter }' CSV;`;
     const client: PoolClient = await DBAccess.getPgClient(conversion);
     let originalSessionReplicationRole: string | null = null;
 
@@ -127,36 +128,71 @@ const populateTableWorker = async (
         originalSessionReplicationRole = await disableTriggers(conversion, client);
     }
 
-    let dataBuffer: string[] = [];
     const eventEmitter: EventEmitter = new EventEmitter();
+    const query: Query = mysqlClient.query(sqlRetrieve);
+    let dataBuffer: string[] = [];
 
-    const json2csvStream = await getJson2csvStream(conversion, originalTableName, dataPoolId, client, originalSessionReplicationRole);
+    query
+        .on('error', async (errorSqlRetrieve: string) => {
+            await processDataError(
+                conversion,
+                errorSqlRetrieve,
+                sqlRetrieve,
+                sqlCopy,
+                tableName,
+                dataPoolId,
+                client,
+                originalSessionReplicationRole
+            );
+        })
+        .on('result', async (row: any) => {
+            // TODO: consider to toss try-catch blocks, and avoid async callback!!!
+            try {
+                // !!!Notice, initializing Parser with options once,
+                // within on('fields'), produces corrupted csv somehow.
+                // TODO: check CsvParsingOptions.
+                const csv: string = parse(row, {
+                    delimiter: conversion._delimiter,
+                    header: false,
+                    fields: Object.keys(row),
+                });
 
-    const mysqlClientErrorHandler = async (err: string) => {
-        await processDataError(conversion, err, sql, sqlCopy, tableName, dataPoolId, client, originalSessionReplicationRole);
-    };
+                dataBuffer.push(csv);
 
-    const readDataStream: Readable = mysqlClient
-        .query(sql)
-        .on('error', mysqlClientErrorHandler)
-        .stream({ highWaterMark: conversion._streamsHighWaterMark });
+                if (dataBuffer.length >= conversion._streamsHighWaterMark) {
+                    eventEmitter.emit('chunkBuffered');
+                    mysqlClient.pause();
+                }
+            } catch (csvParsingError) {
+                await processDataError(
+                    conversion,
+                    csvParsingError,
+                    '',
+                    '',
+                    originalTableName,
+                    dataPoolId,
+                    client,
+                    originalSessionReplicationRole
+                );
+            }
+        })
+        .on('end', () => {
+            // Current connection should not be released, because it will not be reused.
+            // This is due the "DataLoader" process termination.
+            // Hence, the connection should be "destroyed".
+            mysqlClient.destroy();
+        });
 
     eventEmitter.on('chunkLoaded', () => {
-        // readDataStream.resume();
-        json2csvStream.resume();
+        mysqlClient.resume();
     });
 
     eventEmitter.on('chunkBuffered', () => {
-        const readableOptions: ReadableOptions = {
-            objectMode: true,
-            highWaterMark: conversion._streamsHighWaterMark,
-        };
-
-        const copyStream: any = getCopyStream(
+        const copyStream = getCopyStream(
             conversion,
             client,
             sqlCopy,
-            sql,
+            sqlRetrieve,
             tableName,
             rowsCnt,
             dataPoolId,
@@ -164,6 +200,11 @@ const populateTableWorker = async (
             dataBuffer,
             eventEmitter
         );
+
+        const readableOptions: ReadableOptions = {
+            objectMode: true,
+            highWaterMark: conversion._streamsHighWaterMark,
+        };
 
         const dataStream: Readable = Readable.from(dataBuffer, readableOptions);
 
@@ -175,43 +216,6 @@ const populateTableWorker = async (
             .on('end', () => dataStream.destroy())
             .pipe(copyStream);
     });
-
-    const bufferStream: Writable = new Writable({
-        highWaterMark: conversion._streamsHighWaterMark,
-        objectMode: true,
-        write: (record: any, encoding: BufferEncoding, next: (error?: Error | null) => void) => {
-            // TODO:
-            // !!! Notice, the record with id 16385 is always the last record read.
-            // !!! Seems that Node.js mysql stream always reads from the beginning after resuming.
-            // !!! Resuming the stream from the beginning causes inserting duplicates (always inserts records only from the first batch) !!!
-
-            if (+record.split(',')[0] >= 16384) {
-                console.log(); // TODO: remove asap.
-                console.log(`First record in chunk: ${ record }`);
-                console.log();
-            }
-
-            if (dataBuffer.length === conversion._streamsHighWaterMark) {
-                console.log(); // TODO: remove asap.
-                console.log(`Last record in chunk: ${ record }`);
-                console.log();
-
-                eventEmitter.emit('chunkBuffered');
-                console.log('CONGRATS!!!'); // TODO: remove asap.
-                console.log(dataBuffer.length);
-                console.log(dataBuffer[dataBuffer.length - 1]);
-                console.log();
-                // readDataStream.pause();
-                json2csvStream.pause();
-            } else {
-                dataBuffer.push(record);
-            }
-
-            next();
-        }
-    });
-
-    readDataStream.pipe(json2csvStream).pipe(bufferStream);
 };
 
 /**
@@ -228,7 +232,7 @@ const getCopyStream = (
     originalSessionReplicationRole: string | null,
     dataBuffer: string[],
     eventEmitter: EventEmitter
-): any => {
+) => {
     const copyStream: any = client.query(from(sqlCopy));
 
     copyStream
@@ -240,6 +244,7 @@ const getCopyStream = (
             // TODO: continue.
             dataBuffer = [];
             eventEmitter.emit('chunkLoaded');
+            copyStream.destroy();
 
             // processSend(new MessageToMaster(tableName, rowsCnt));
             // await deleteChunk(conv, dataPoolId, client);
@@ -249,48 +254,6 @@ const getCopyStream = (
         });
 
     return copyStream;
-};
-
-/**
- * Returns new json-to-csv stream-transform object.
- */
-const getJson2csvStream = async (
-    conversion: Conversion,
-    originalTableName: string,
-    dataPoolId: number,
-    client: PoolClient,
-    originalSessionReplicationRole: string | null
-): Promise<any> => {
-    const params: IDBAccessQueryParams = {
-        conversion: conversion,
-        caller: 'DataLoader::populateTableWorker',
-        sql: `SHOW COLUMNS FROM \`${ originalTableName }\`;`,
-        vendor: DBVendors.MYSQL,
-        processExitOnError: true,
-        shouldReturnClient: false
-    };
-
-    const tableColumnsResult: DBAccessQueryResult = await DBAccess.query(params);
-
-    const options: any = {
-        delimiter: conversion._delimiter,
-        header: false,
-        fields: tableColumnsResult.data.map((column: any) => column.Field)
-    };
-
-    const streamTransformOptions: any = {
-        highWaterMark: conversion._streamsHighWaterMark,
-        objectMode: true,
-        encoding: conversion._encoding
-    };
-
-    const json2CsvTransformStream = new Json2CsvTransform(options, streamTransformOptions);
-
-    json2CsvTransformStream.on('error', async (transformError: string) => {
-        await processDataError(conversion, transformError, '', '', originalTableName, dataPoolId, client, originalSessionReplicationRole);
-    });
-
-    return json2CsvTransformStream;
 };
 
 /**
