@@ -96,7 +96,7 @@ export const createSequence = async (conversion: Conversion, tableName: string):
 
     params.client = createSequenceResult.client;
     params.sql = `ALTER TABLE "${ conversion._schema }"."${ tableName }" ALTER COLUMN "${ columnName }" 
-        SET DEFAULT NEXTVAL('${ conversion._schema }.${ seqName }');`;
+        SET DEFAULT NEXTVAL('"${ conversion._schema }"."${ seqName }"');`;
 
     const setNextValResult: DBAccessQueryResult = await DBAccess.query(params);
 

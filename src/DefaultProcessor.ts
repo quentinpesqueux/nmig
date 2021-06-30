@@ -36,7 +36,7 @@ export default async (conversion: Conversion, tableName: string): Promise<void> 
     const msg: string = `\t--[${ logTitle }] Defines default values for table: "${ conversion._schema }"."${ tableName }"`;
     log(conversion, msg, conversion._dicTables[tableName].tableLogPath);
     const originalTableName: string = extraConfigProcessor.getTableName(conversion, tableName, true);
-    const pgSqlNumericTypes: string[] = ['money', 'numeric', 'decimal', 'double precision', 'real', 'bigint', 'int', 'smallint'];
+    const pgSqlNumericTypes: string[] = ['money', 'numeric', 'decimal', 'double precision', 'real', 'bigint', 'int', 'smallint', 'bit'];
     const sqlReservedValues: any = {
         'CURRENT_DATE': 'CURRENT_DATE',
         '0000-00-00': "'-INFINITY'",
@@ -60,7 +60,7 @@ export default async (conversion: Conversion, tableName: string): Promise<void> 
 
         if (sqlReservedValues[column.Default]) {
             sql += `${ sqlReservedValues[column.Default] };`;
-        } else if (pgSqlNumericTypes.indexOf(pgSqlDataType) === -1) {
+        } else if (pgSqlNumericTypes.indexOf(pgSqlDataType.substr(0,pgSqlDataType.indexOf(' '))) === -1) {
             sql += `'${ column.Default }';`;
         } else {
             sql += `${ column.Default };`;
